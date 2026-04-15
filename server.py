@@ -476,9 +476,7 @@ def run_training():
             n_above_55 = len(val_df[val_df["prob"]>=0.55])
 
             # Exit reason breakdown (val)
-            reason_counts = val_df.groupby(df.columns.get_loc("reason") if "reason" in df.columns else "label").size().to_dict() if "reason" in val_df.columns else {}
-            # Actually get from raw rows
-            val_reasons = df[df["date"].isin(val_dates)]["reason"].value_counts().to_dict() if "reason" in df.columns else {}
+            val_reasons = val_df["reason"].value_counts().to_dict() if "reason" in val_df.columns else {}
 
             # Isotonic calibration
             cal = IsotonicRegression(out_of_bounds="clip", y_min=0.01, y_max=0.95)
