@@ -1,0 +1,18 @@
+services:
+  - type: web
+    runtime: docker
+    name: sp500-intraday-scanner
+    plan: pro
+    disk:
+      name: scanner-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_API_SECRET
+        sync: false
+      - key: ALPACA_DATA_URL
+        value: https://data.alpaca.markets
+      - key: WEB_CONCURRENCY
+        value: "1"
