@@ -19,9 +19,9 @@ function SourceBadge({source,trained}) {
     </div>);
 }
 
-function WinBar({winProb,ev}) {
+function WinBar({winProb,ev,breakeven=0.612}) {
   const pct=(winProb*100).toFixed(1);
-  const c=winProb>0.70?"#22c55e":winProb>0.65?"#a3e635":winProb>0.61?"#eab308":winProb>0.55?"#f97316":"#6b7280";
+  const c=winProb>breakeven+0.09?"#22c55e":winProb>breakeven+0.04?"#a3e635":winProb>breakeven?"#eab308":winProb>breakeven-0.06?"#f97316":"#6b7280";
   const evColor = ev>0?"#22c55e":ev<0?"#ef4444":"#64748b";
   return (
     <div style={{display:"flex",alignItems:"center",gap:6,minWidth:180}}>
@@ -44,7 +44,7 @@ function Fc({value,label}) {
 }
 
 // ─── SCANNER ─────────────────────────────────────────────────────
-function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10}) {
+function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,health,scanInfo}) {
   const [mode,setMode]=useState("posEV");
 
   if(source==="offline"||!data||data.length===0) return (
@@ -53,8 +53,14 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10})
       <div style={{fontSize:12,color:"#475569"}}>{message||"Train model, then scan during market hours."}</div>
     </Box>);
 
-  const filtered = mode==="be" ? data.filter(s=>s.winProb>=0.612)
-    : mode==="be5" ? data.filter(s=>s.winProb>=0.662)
+  const activeTP = scanInfo?.tp_pct ?? health?.tp_pct ?? 0.95;
+  const activeSL = scanInfo?.sl_pct ?? health?.sl_pct ?? 1.50;
+  const activeBE = scanInfo?.breakeven ?? health?.breakeven ?? (activeSL/(activeSL+activeTP)*100).toFixed(1);
+  const beThresh = activeSL/(activeSL+activeTP);
+  const beThresh5 = beThresh + 0.05;
+
+  const filtered = mode==="be" ? data.filter(s=>s.winProb>=beThresh)
+    : mode==="be5" ? data.filter(s=>s.winProb>=beThresh5)
     : mode==="posEV" ? data.filter(s=>s.ev>0)
     : data.slice(0, mode==="top10"?10:20);
   const posEV = data.filter(s=>s.ev>0);
@@ -65,7 +71,7 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10})
       <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
         <div style={{display:"flex",alignItems:"center",gap:6}}>
           <span style={{fontSize:10,color:"#475569",textTransform:"uppercase",letterSpacing:0.5}}>Show</span>
-          {[["posEV","+EV"],["be","Win>61%"],["be5","Win>66%"],["top10","Top 10"],["top20","Top 20"]].map(([m,l])=>
+          {[["posEV","+EV"],["be",`Win>${(beThresh*100).toFixed(0)}%`],["be5",`Win>${(beThresh5*100).toFixed(0)}%`],["top10","Top 10"],["top20","Top 20"]].map(([m,l])=>
             <Btn key={m} active={mode===m} onClick={()=>setMode(m)}>{l}</Btn>)}
         </div>
         <span style={{fontSize:11,color:"#334155"}}>
@@ -84,7 +90,7 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10})
         <Box style={{padding:12}}>
           <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
             <span style={{fontSize:11,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase"}}>
-              {filtered.length} stocks — TP +0.95% / SL -1.50% / Close 15:55 (break-even: 61.2% win rate)
+              {filtered.length} stocks — TP +{activeTP}% / SL -{activeSL}% / Close 15:55 (break-even: {activeBE}% win rate)
             </span>
             {posEV.length>0&&<span style={{fontSize:11,color:"#22c55e"}}>Avg EV (positive): +{avgEV.toFixed(3)}%</span>}
           </div>
@@ -104,7 +110,7 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10})
                   <td style={{padding:"5px 6px",color:"#64748b",fontSize:11}}>{s.sector}</td>
                   <td style={{padding:"5px 6px",color:"#94a3b8",fontVariantNumeric:"tabular-nums"}}>${s.price}</td>
                   <td style={{padding:"5px 6px",color:chg>0?"#22c55e":chg<0?"#ef4444":"#94a3b8",fontVariantNumeric:"tabular-nums",fontWeight:500}}>{chg>0?"+":""}{chg}%</td>
-                  <td style={{padding:"5px 6px"}} colSpan={2}><WinBar winProb={s.winProb} ev={s.ev}/></td>
+                  <td style={{padding:"5px 6px"}} colSpan={2}><WinBar winProb={s.winProb} ev={s.ev} breakeven={beThresh}/></td>
                   <td style={{padding:"5px 6px"}}><Fc value={s.features.momentum} label="momentum"/></td>
                   <td style={{padding:"5px 6px"}}><Fc value={s.features.relVolume} label="relVolume"/></td>
                   <td style={{padding:"5px 6px"}}><Fc value={s.features.vwapDist} label="vwapDist"/></td>
@@ -129,34 +135,91 @@ function TrainingTab() {
 
   const poll=useCallback(()=>{fetch('/api/training/progress').then(r=>r.json()).then(d=>{setD(d);setLd(false);}).catch(()=>setLd(false));},[]);
   useEffect(()=>{poll();const iv=setInterval(poll,2000);return()=>clearInterval(iv);},[poll]);
-  const trigTrain=async()=>{await fetch('/api/train',{method:'POST'});poll();};
+
+  const [tp,setTp]=useState(0.95);
+  const [sl,setSl]=useState(1.50);
+  const breakeven = (sl/(sl+tp)*100).toFixed(1);
+
+  const trigTrain=async()=>{
+    await fetch('/api/train',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tp_pct:tp,sl_pct:sl})});
+    poll();
+  };
+  const clearCache=async()=>{
+    if(!confirm("Clear cached bar data? Next training will refetch 12 months from Alpaca (10-15 min).")) return;
+    const r=await fetch('/api/cache/clear',{method:'POST'});
+    const d=await r.json();
+    alert(d.error?`Error: ${d.error}`:`Cleared: ${d.deleted.join(", ")||"nothing"}`);
+  };
 
   if(ld) return <div style={{color:"#475569",padding:40,textAlign:"center"}}>Loading...</div>;
   const ip=d?.inProgress,pg=d||{},meta=d?.meta||{};
   const sm=meta[String(sh)];
+  const activeTP = Object.values(meta)[0]?.tp_pct;
+  const activeSL = Object.values(meta)[0]?.sl_pct;
+  const activeBE = activeTP && activeSL ? (activeSL/(activeSL+activeTP)*100).toFixed(1) : null;
+
+  const Slider = ({label,value,setValue,min,max,step,color})=>(
+    <div style={{marginBottom:10}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+        <span style={{fontSize:11,color:"#94a3b8",fontWeight:500}}>{label}</span>
+        <span style={{fontSize:13,color:color,fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{value.toFixed(2)}%</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e=>setValue(parseFloat(e.target.value))}
+        disabled={ip}
+        style={{width:"100%",accentColor:color,cursor:ip?"not-allowed":"pointer"}}/>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:9,color:"#475569",marginTop:2}}>
+        <span>{min}%</span><span>{max}%</span>
+      </div>
+    </div>);
 
   return (
     <div style={{display:"flex",flexDirection:"column",gap:12}}>
       <Box>
-        <Lbl>Model Training — First-Passage (+0.95% TP / -1.50% SL, break-even 61.2%)</Lbl>
-        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
-          <div style={{fontSize:12,lineHeight:2,color:"#94a3b8"}}>
-            {[
-              {l:"Models",v:Object.keys(meta).length>0?Object.keys(meta).map(h=>h+":00").join(", "):"None",ok:Object.keys(meta).length>0},
-              {l:"Trained",v:Object.values(meta)[0]?.trained_at?new Date(Object.values(meta)[0].trained_at).toLocaleDateString():"Never",ok:Object.keys(meta).length>0},
-              {l:"Strategy",v:`TP +${Object.values(meta)[0]?.tp_pct||0.95}% / SL -${Object.values(meta)[0]?.sl_pct||0.95}%`,ok:true},
-            ].map((c,i)=>(
-              <div key={i} style={{display:"flex",alignItems:"center",gap:8}}>
-                <span style={{width:14,height:14,borderRadius:3,display:"flex",alignItems:"center",justifyContent:"center",
-                  background:c.ok?"rgba(34,197,94,0.15)":"rgba(239,68,68,0.15)",color:c.ok?"#22c55e":"#ef4444",fontSize:10,fontWeight:900}}>{c.ok?"✓":"✗"}</span>
-                <span style={{minWidth:120}}>{c.l}</span>
-                <span style={{color:c.ok?"#e2e8f0":"#ef4444",fontWeight:500}}>{c.v}</span>
-              </div>))}
+        <Lbl>Model Training — First-Passage</Lbl>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:20}}>
+          <div>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:10,textTransform:"uppercase",letterSpacing:0.5}}>
+              Strategy Parameters
+            </div>
+            <Slider label="Take Profit" value={tp} setValue={setTp} min={0.20} max={2.00} step={0.05} color="#22c55e"/>
+            <Slider label="Stop Loss" value={sl} setValue={setSl} min={0.20} max={3.00} step={0.05} color="#ef4444"/>
+            <div style={{marginTop:12,padding:"8px 10px",borderRadius:4,
+              background:"rgba(234,179,8,0.06)",border:"1px solid rgba(234,179,8,0.15)"}}>
+              <div style={{fontSize:11,color:"#94a3b8",marginBottom:2}}>Break-even win rate (this setting)</div>
+              <div style={{fontSize:18,color:"#eab308",fontWeight:700,fontVariantNumeric:"tabular-nums"}}>{breakeven}%</div>
+              <div style={{fontSize:10,color:"#64748b",marginTop:2}}>
+                Model must exceed this to be profitable. Reward:Risk = {(tp/sl).toFixed(2)}:1
+              </div>
+            </div>
           </div>
           <div>
-            <Btn onClick={trigTrain} disabled={ip} color="#8b5cf6" style={{padding:"8px 16px",fontSize:12}}>
-              {ip?"Training...":"Train Models (12 months)"}
-            </Btn>
+            <div style={{fontSize:11,color:"#64748b",marginBottom:10,textTransform:"uppercase",letterSpacing:0.5}}>
+              Current Status
+            </div>
+            <div style={{fontSize:12,lineHeight:2,color:"#94a3b8",marginBottom:14}}>
+              {[
+                {l:"Models",v:Object.keys(meta).length>0?`${Object.keys(meta).length} hours trained`:"None",ok:Object.keys(meta).length>0},
+                {l:"Active TP/SL",v:activeTP?`+${activeTP}% / -${activeSL}%`:"—",ok:!!activeTP},
+                {l:"Active break-even",v:activeBE?`${activeBE}%`:"—",ok:!!activeBE},
+                {l:"Trained",v:Object.values(meta)[0]?.trained_at?new Date(Object.values(meta)[0].trained_at).toLocaleString():"Never",ok:Object.keys(meta).length>0},
+              ].map((c,i)=>(
+                <div key={i} style={{display:"flex",alignItems:"center",gap:8}}>
+                  <span style={{width:12,height:12,borderRadius:3,display:"flex",alignItems:"center",justifyContent:"center",
+                    background:c.ok?"rgba(34,197,94,0.15)":"rgba(100,116,139,0.15)",color:c.ok?"#22c55e":"#64748b",fontSize:9,fontWeight:900}}>{c.ok?"✓":"·"}</span>
+                  <span style={{minWidth:130,fontSize:11}}>{c.l}</span>
+                  <span style={{color:c.ok?"#e2e8f0":"#64748b",fontWeight:500}}>{c.v}</span>
+                </div>))}
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <Btn onClick={trigTrain} disabled={ip} color="#8b5cf6" style={{padding:"8px 16px",fontSize:12}}>
+                {ip?"Training...":`Train (TP ${tp}% / SL ${sl}%)`}
+              </Btn>
+              <Btn onClick={clearCache} disabled={ip} color="#ef4444" style={{padding:"8px 12px",fontSize:11}}>
+                Clear cache
+              </Btn>
+            </div>
             {ip&&(
               <div style={{marginTop:10}}>
                 <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
@@ -167,6 +230,9 @@ function TrainingTab() {
                 </div>
                 <div style={{fontSize:11,color:"#64748b"}}>{pg.message}</div>
               </div>)}
+            <div style={{marginTop:10,fontSize:10,color:"#475569",lineHeight:1.5}}>
+              First training fetches 12 months of bars (~15 min). Re-training with different TP/SL uses cached bars (~2-3 min).
+            </div>
           </div>
         </div>
       </Box>
@@ -298,6 +364,7 @@ export default function SP500Scanner() {
   const [elapsed,setElapsed]=useState(null);
   const [modelWR10,setModelWR10]=useState(null);
   const [modelPnL10,setModelPnL10]=useState(null);
+  const [scanInfo,setScanInfo]=useState(null);
   const [health,setHealth]=useState(null);
   const [error,setError]=useState(null);
   const [message,setMessage]=useState(null);
@@ -313,6 +380,7 @@ export default function SP500Scanner() {
       const d=await r.json();
       setData(d.data||[]);setSource(d.source||"offline");setLastUpdate(d.timestamp);
       setElapsed(d.elapsed||null);setModelWR10(d.modelWR10||null);setModelPnL10(d.modelPnL10||null);
+      setScanInfo({tp_pct:d.tp_pct,sl_pct:d.sl_pct,breakeven:d.breakeven});
       setMessage(d.message||null);
     }catch(err){setError(err.message);setSource("error");setData([]);}
     finally{setLoading(false);}
@@ -338,7 +406,9 @@ export default function SP500Scanner() {
           <SourceBadge source={loading?"loading":source} trained={health?.trained}/>
         </div>
         <div style={{display:"flex",gap:4,fontSize:11,flexWrap:"wrap",alignItems:"center"}}>
-          <span style={{color:"#eab308",fontWeight:600}}>TP +0.95% / SL -1.50% / Close 15:55</span>
+          <span style={{color:"#eab308",fontWeight:600}}>
+            {health ? `TP +${health.tp_pct}% / SL -${health.sl_pct}% / Close 15:55 (BE ${health.breakeven}%)` : "Loading..."}
+          </span>
           {lastUpdate&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
         </div>
       </div>
@@ -358,7 +428,7 @@ export default function SP500Scanner() {
       {error&&<div style={{margin:"12px 20px 0",padding:"8px 12px",borderRadius:6,background:"rgba(239,68,68,0.1)",border:"1px solid rgba(239,68,68,0.2)",color:"#ef4444",fontSize:12}}>{error}</div>}
 
       <div style={{padding:"16px 20px"}}>
-        {tab==="scanner"&&<ScannerTab data={data} scanHour={scanHour} source={source} elapsed={elapsed} message={message} modelWR10={modelWR10} modelPnL10={modelPnL10}/>}
+        {tab==="scanner"&&<ScannerTab data={data} scanHour={scanHour} source={source} elapsed={elapsed} message={message} modelWR10={modelWR10} modelPnL10={modelPnL10} health={health} scanInfo={scanInfo}/>}
         {tab==="training"&&<TrainingTab/>}
         {tab==="outcomes"&&<OutcomesTab/>}
         {tab==="status"&&<StatusTab health={health}/>}

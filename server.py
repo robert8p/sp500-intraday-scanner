@@ -10,6 +10,8 @@ import lightgbm as lgb
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 import httpx
+from pydantic import BaseModel
+from typing import Optional
 
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
@@ -183,23 +185,17 @@ def bar_to_et_minutes(b):
 # ═══════════════════════════════════════════════════════════════════
 # FIRST-PASSAGE LABEL: does price hit TP before SL?
 # ═══════════════════════════════════════════════════════════════════
-def compute_trade_outcome(entry_price, bars_after_entry):
+def compute_trade_outcome(entry_price, bars_after_entry, tp_pct=None, sl_pct=None):
     """
-    Walk bars in order. Check each bar:
-    - If high >= entry * (1+TP_PCT): WIN (TP hit first in this bar)
-    - If low <= entry * (1-SL_PCT): LOSS (SL hit first in this bar)
-    - If BOTH could fire in same bar: use open to determine direction
-      (if open is closer to TP, assume TP hit first; else SL)
-    - If bar is past 15:55 ET: force close at that bar's close
-    - If no barrier hit: use final bar's close for P&L
+    Walk bars in order. Check each bar against TP/SL barriers.
+    tp_pct/sl_pct default to global TP_PCT/SL_PCT if not provided.
 
     Returns: (outcome, pnl_pct, exit_reason)
-      outcome: 1=win, 0=loss
-      pnl_pct: actual return percentage
-      exit_reason: 'tp'|'sl'|'close_15:55'|'eod'
     """
-    tp_price = entry_price * (1 + TP_PCT)
-    sl_price = entry_price * (1 - SL_PCT)
+    if tp_pct is None: tp_pct = TP_PCT
+    if sl_pct is None: sl_pct = SL_PCT
+    tp_price = entry_price * (1 + tp_pct)
+    sl_price = entry_price * (1 - sl_pct)
 
     for b in bars_after_entry:
         bmin = bar_to_et_minutes(b)
@@ -215,13 +211,13 @@ def compute_trade_outcome(entry_price, bars_after_entry):
         if hit_tp and hit_sl:
             # Both barriers in same bar — use open to disambiguate
             if b["o"] >= entry_price:
-                return (1, round(TP_PCT * 100, 3), "tp")
+                return (1, round(tp_pct * 100, 3), "tp")
             else:
-                return (0, round(-SL_PCT * 100, 3), "sl")
+                return (0, round(-sl_pct * 100, 3), "sl")
         elif hit_tp:
-            return (1, round(TP_PCT * 100, 3), "tp")
+            return (1, round(tp_pct * 100, 3), "tp")
         elif hit_sl:
-            return (0, round(-SL_PCT * 100, 3), "sl")
+            return (0, round(-sl_pct * 100, 3), "sl")
 
     # No barrier hit, no 15:55 bar — use last bar close
     if bars_after_entry:
@@ -333,26 +329,65 @@ def feat_to_arr(f):
 # ═══════════════════════════════════════════════════════════════════
 # TRAINING — FIRST-PASSAGE LABELS
 # ═══════════════════════════════════════════════════════════════════
-def run_training():
+CACHE_DIR = DATA_DIR / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+BARS_DAILY_CACHE = CACHE_DIR / "bars_daily.pkl"
+BARS_INTRADAY_CACHE = CACHE_DIR / "bars_intraday.pkl"
+CACHE_MAX_AGE_HOURS = 24
+
+def cache_age_hours(path):
+    if not path.exists(): return 999
+    age_sec = time.time() - path.stat().st_mtime
+    return age_sec / 3600
+
+def run_training(tp_pct=None, sl_pct=None):
+    """
+    Train models with optional override TP/SL. If tp_pct/sl_pct are provided,
+    labels are recomputed with those barriers. Bar data is cached on disk so
+    only the first training fetches from Alpaca; subsequent trainings with
+    different TP/SL skip the fetch.
+    """
     global models, calibrators, model_meta, training_in_progress, training_progress, status
     if training_in_progress: return
     training_in_progress = True
     training_progress = {"phase":"starting","pct":0,"message":"Starting..."}
 
+    # Use globals as defaults; allow override
+    use_tp = tp_pct if tp_pct is not None else TP_PCT
+    use_sl = sl_pct if sl_pct is not None else SL_PCT
+
     try:
-        client = alpaca_client()
-        end_date = today_et()
-        start_obj = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=380)
-        start_date = start_obj.strftime("%Y-%m-%d")
+        # ─── Load or fetch bar data ──────────────────────────────────
+        daily_age = cache_age_hours(BARS_DAILY_CACHE)
+        intra_age = cache_age_hours(BARS_INTRADAY_CACHE)
+        cache_fresh = daily_age < CACHE_MAX_AGE_HOURS and intra_age < CACHE_MAX_AGE_HOURS
 
-        training_progress = {"phase":"fetch_daily","pct":3,"message":"Fetching daily bars..."}
-        daily_bars = fetch_bars(client, TICKERS, "1Day", start_date, end_date)
+        if cache_fresh:
+            training_progress = {"phase":"loading_cache","pct":5,
+                "message":f"Loading cached bars (age {intra_age:.1f}h)..."}
+            log.info(f"Using cached bars (daily age {daily_age:.1f}h, intraday age {intra_age:.1f}h)")
+            daily_bars = pickle.loads(BARS_DAILY_CACHE.read_bytes())
+            intraday = pickle.loads(BARS_INTRADAY_CACHE.read_bytes())
+        else:
+            client = alpaca_client()
+            end_date = today_et()
+            start_obj = datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=380)
+            start_date = start_obj.strftime("%Y-%m-%d")
 
-        training_progress = {"phase":"fetch_intraday","pct":8,"message":"Fetching 12 months of 5-min bars (10-15 min)..."}
-        intraday = fetch_bars(client, TICKERS, "5Min",
-                              f"{start_date}T09:30:00-04:00", f"{end_date}T16:00:00-04:00")
-        client.close()
+            training_progress = {"phase":"fetch_daily","pct":3,"message":"Fetching daily bars..."}
+            daily_bars = fetch_bars(client, TICKERS, "1Day", start_date, end_date)
 
+            training_progress = {"phase":"fetch_intraday","pct":8,"message":"Fetching 12 months of 5-min bars (10-15 min)..."}
+            intraday = fetch_bars(client, TICKERS, "5Min",
+                                  f"{start_date}T09:30:00-04:00", f"{end_date}T16:00:00-04:00")
+            client.close()
+
+            training_progress = {"phase":"caching","pct":44,"message":"Caching bars to disk..."}
+            BARS_DAILY_CACHE.write_bytes(pickle.dumps(daily_bars))
+            BARS_INTRADAY_CACHE.write_bytes(pickle.dumps(intraday))
+            log.info(f"Cached {sum(len(v) for v in intraday.values())} intraday bars to disk")
+
+        # ─── Group bars by ticker+date ───────────────────────────────
         training_progress = {"phase":"grouping","pct":45,"message":"Grouping bars by date..."}
         by_td = defaultdict(lambda: defaultdict(list))
         for ticker in TICKERS:
@@ -360,9 +395,11 @@ def run_training():
                 by_td[ticker][b["t"][:10]].append(b)
 
         all_dates = sorted(set(d for t in by_td for d in by_td[t]))
-        log.info(f"Training: {len(all_dates)} dates, first-passage labels (TP={TP_PCT*100}% / SL={SL_PCT*100}%)")
+        log.info(f"Training: {len(all_dates)} dates, TP={use_tp*100:.2f}% / SL={use_sl*100:.2f}%")
 
-        training_progress = {"phase":"features","pct":50,"message":"Computing features + first-passage outcomes..."}
+        # ─── Build training dataset with the specified TP/SL ─────────
+        training_progress = {"phase":"features","pct":50,
+            "message":f"Computing outcomes (TP {use_tp*100:.2f}% / SL {use_sl*100:.2f}%)..."}
         rows_per_hour = defaultdict(list)
 
         for di, date in enumerate(all_dates):
@@ -383,8 +420,6 @@ def run_training():
 
                     if len(before) < 3 or len(after) < 2: continue
 
-                    # 1-bar entry delay: features from bars before scan,
-                    # but entry price is the OPEN of the first bar after scan
                     entry_price = after[0]["o"]
                     feature_price = before[-1]["c"]
                     open_price = day_bars[0]["o"]
@@ -393,9 +428,8 @@ def run_training():
                     feat = compute_features(before, daily_up_to, feature_price, open_price, scan_hour)
                     if feat is None: continue
 
-                    # First-passage outcome starting from entry_price, bars after entry
-                    # Skip the first bar (entry bar) — start checking from bar index 1
-                    outcome, pnl, reason = compute_trade_outcome(entry_price, after[1:])
+                    # First-passage outcome with the requested TP/SL
+                    outcome, pnl, reason = compute_trade_outcome(entry_price, after[1:], tp_pct=use_tp, sl_pct=use_sl)
 
                     date_features.append(feat)
                     date_meta.append({"ticker":ticker,"label":outcome,"pnl":pnl,"reason":reason,"date":date})
@@ -471,7 +505,7 @@ def run_training():
 
             # EV at various thresholds
             # Break-even threshold for asymmetric barriers: TP*P = SL*(1-P) → P = SL/(SL+TP)
-            breakeven_p = SL_PCT / (SL_PCT + TP_PCT)
+            breakeven_p = use_sl / (use_sl + use_tp)
 
             # EV at various probability thresholds
             def ev_at(thresh):
@@ -522,7 +556,7 @@ def run_training():
                 "importance":imp,
                 "trained_at":datetime.now(ET).isoformat(),
                 "best_iteration":model.best_iteration,
-                "tp_pct":TP_PCT*100, "sl_pct":SL_PCT*100
+                "tp_pct":use_tp*100, "sl_pct":use_sl*100
             }
             (MODEL_DIR / f"meta_{h}.json").write_text(json.dumps(meta, indent=2))
 
@@ -537,10 +571,13 @@ def run_training():
         status["trained"] = True
         status["trainDate"] = datetime.now(ET).isoformat()
         status["daysSinceRetrain"] = 0
+        status["activeTP"] = use_tp * 100
+        status["activeSL"] = use_sl * 100
         save_status(status)
 
-        training_progress = {"phase":"done","pct":100,"message":f"Done. {len(new_models)} models trained."}
-        log.info("Training complete.")
+        training_progress = {"phase":"done","pct":100,
+            "message":f"Done. {len(new_models)} models trained (TP {use_tp*100:.2f}% / SL {use_sl*100:.2f}%)."}
+        log.info(f"Training complete. Active TP/SL: {use_tp*100:.2f}% / {use_sl*100:.2f}%")
 
     except Exception as e:
         log.error(f"Training failed: {e}", exc_info=True)
@@ -578,6 +615,11 @@ def run_live_scan(scan_hour):
     if len(raw_feats) < 5: raise ValueError(f"Only {len(raw_feats)} stocks")
     add_ranks(raw_feats)
 
+    # Use active TP/SL from the trained model's meta (falls back to globals)
+    meta = model_meta.get(scan_hour, {})
+    active_tp = (meta.get("tp_pct", TP_PCT*100)) / 100
+    active_sl = (meta.get("sl_pct", SL_PCT*100)) / 100
+
     X = np.array([feat_to_arr(f) for f in raw_feats])
     raw_probs = models[scan_hour].predict(X)
     cal_probs = calibrators[scan_hour].predict(raw_probs) if scan_hour in calibrators else raw_probs
@@ -586,7 +628,7 @@ def run_live_scan(scan_hour):
     for i in range(len(raw_feats)):
         si, rf = stock_info[i], raw_feats[i]
         wp = float(cal_probs[i])
-        ev = (wp * TP_PCT - (1 - wp) * SL_PCT) * 100  # EV per trade in % (asymmetric)
+        ev = (wp * active_tp - (1 - wp) * active_sl) * 100  # EV per trade in % (asymmetric)
         results.append({
             "rank":0,"ticker":si["ticker"],"sector":si["sector"],
             "price":f"{si['price']:.2f}",
@@ -607,7 +649,6 @@ def run_live_scan(scan_hour):
     for i,r in enumerate(results): r["rank"] = i+1
 
     elapsed = int((time.time()-t0)*1000)
-    meta = model_meta.get(scan_hour, {})
 
     scan_result = {
         "data":results,"timestamp":datetime.now(ET).isoformat(),"source":"live",
@@ -615,7 +656,8 @@ def run_live_scan(scan_hour):
         "modelAUC":meta.get("auc"),"modelWR10":meta.get("avg_win_rate_top10"),
         "modelPnL10":meta.get("avg_pnl_top10"),
         "scoreRange":{"min":results[-1]["rawScore"],"max":results[0]["rawScore"]} if results else None,
-        "tp_pct":TP_PCT*100,"sl_pct":SL_PCT*100
+        "tp_pct":active_tp*100,"sl_pct":active_sl*100,
+        "breakeven":round(active_sl/(active_sl+active_tp)*100,1)
     }
 
     sp = SCAN_DIR / f"{today}.json"
@@ -700,6 +742,9 @@ app = FastAPI()
 
 @app.get("/api/health")
 def health():
+    # Prefer active TP/SL from last training; fall back to globals
+    active_tp = status.get("activeTP", TP_PCT*100)
+    active_sl = status.get("activeSL", SL_PCT*100)
     return {
         "status":"ok","hasCredentials":has_creds(),"marketOpen":market_open(),
         "currentHourET":hour_et(),
@@ -709,7 +754,8 @@ def health():
         "modelsLoaded":list(models.keys()),
         "hasLastScan":bool(last_scans),
         "lastScanHours":list(last_scans.keys()),
-        "tp_pct":TP_PCT*100,"sl_pct":SL_PCT*100
+        "tp_pct":active_tp,"sl_pct":active_sl,
+        "breakeven":round(active_sl/(active_sl+active_tp)*100,1) if active_tp>0 else 50.0
     }
 
 @app.get("/api/scan/{hour}")
@@ -730,11 +776,43 @@ def refresh(hour: int):
     if hour not in models: return JSONResponse({"error":"No model"},400)
     return run_live_scan(hour)
 
+class TrainRequest(BaseModel):
+    tp_pct: Optional[float] = None  # as percentage, e.g. 0.95 for +0.95%
+    sl_pct: Optional[float] = None  # as percentage, e.g. 1.5 for -1.5%
+
 @app.post("/api/train")
-def trigger_train(bg: BackgroundTasks):
+def trigger_train(bg: BackgroundTasks, req: Optional[TrainRequest] = None):
     if training_in_progress: return {"status":"already_running"}
-    bg.add_task(run_training)
-    return {"status":"started"}
+    # Accept empty body (use globals) or JSON body with tp_pct/sl_pct in percentage units
+    tp_pct = req.tp_pct if req and req.tp_pct is not None else None
+    sl_pct = req.sl_pct if req and req.sl_pct is not None else None
+    # Convert from percentage (0.95) to decimal (0.0095)
+    tp = tp_pct / 100.0 if tp_pct is not None else None
+    sl = sl_pct / 100.0 if sl_pct is not None else None
+    # Bounds check: prevent absurd values
+    if tp is not None and not (0.001 <= tp <= 0.05): return JSONResponse({"error":"tp_pct must be 0.1-5.0"},400)
+    if sl is not None and not (0.001 <= sl <= 0.05): return JSONResponse({"error":"sl_pct must be 0.1-5.0"},400)
+    bg.add_task(run_training, tp, sl)
+    return {"status":"started","tp_pct":tp_pct or TP_PCT*100,"sl_pct":sl_pct or SL_PCT*100}
+
+@app.post("/api/cache/clear")
+def clear_cache():
+    """Delete cached bar data to force fresh fetch on next training."""
+    if training_in_progress: return JSONResponse({"error":"Cannot clear during training"},400)
+    deleted = []
+    for f in [BARS_DAILY_CACHE, BARS_INTRADAY_CACHE]:
+        if f.exists():
+            f.unlink()
+            deleted.append(f.name)
+    return {"status":"ok","deleted":deleted}
+
+@app.get("/api/cache/status")
+def cache_status():
+    return {
+        "daily": {"exists":BARS_DAILY_CACHE.exists(),"age_hours":round(cache_age_hours(BARS_DAILY_CACHE),1)},
+        "intraday": {"exists":BARS_INTRADAY_CACHE.exists(),"age_hours":round(cache_age_hours(BARS_INTRADAY_CACHE),1)},
+        "max_age_hours":CACHE_MAX_AGE_HOURS
+    }
 
 @app.get("/api/training/progress")
 def progress():
