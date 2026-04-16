@@ -128,6 +128,157 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10,h
 }
 
 // ─── TRAINING ────────────────────────────────────────────────────
+// ─── SWEEP (grid search over TP/SL) ──────────────────────────────
+function SweepSection() {
+  const [status,setStatus]=useState(null);
+  const [results,setResults]=useState(null);
+
+  const poll=useCallback(()=>{
+    fetch('/api/sweep/status').then(r=>r.json()).then(setStatus).catch(()=>{});
+    fetch('/api/sweep/results').then(r=>r.json()).then(setResults).catch(()=>{});
+  },[]);
+  useEffect(()=>{poll();const iv=setInterval(poll,3000);return()=>clearInterval(iv);},[poll]);
+
+  const runSweep=async()=>{
+    if(!confirm("Run grid search? 15 combinations, ~30-45 minutes. Scanner will be offline during this time. Runs in background — safe to close browser.")) return;
+    await fetch('/api/sweep',{method:'POST'});
+    poll();
+  };
+  const resetSweep=async()=>{
+    if(!confirm("Discard all sweep results? The next sweep will start from scratch.")) return;
+    await fetch('/api/sweep/reset',{method:'POST'});
+    poll();
+  };
+
+  const ip = status?.inProgress;
+  const grid = status?.grid;
+  const gridResults = results?.grid || [];
+  const resultMap = {};
+  gridResults.forEach(r => { resultMap[`${r.tp_pct}_${r.sl_pct}`] = r; });
+  const total = grid ? grid.tp.length * grid.sl.length : 0;
+  const done = gridResults.length;
+
+  // Find best cell by avg_edge
+  const best = gridResults.filter(r=>r.avg_edge!=null).sort((a,b)=>b.avg_edge-a.avg_edge)[0];
+
+  // Color scale for edge values: red (negative) -> yellow (0) -> green (positive)
+  const edgeColor = (edge) => {
+    if (edge == null) return "rgba(100,116,139,0.1)";
+    if (edge >= 5) return "rgba(34,197,94,0.4)";
+    if (edge >= 3) return "rgba(34,197,94,0.25)";
+    if (edge >= 1) return "rgba(163,230,53,0.22)";
+    if (edge >= 0) return "rgba(234,179,8,0.18)";
+    if (edge >= -3) return "rgba(249,115,22,0.18)";
+    return "rgba(239,68,68,0.22)";
+  };
+
+  return (
+    <Box>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+        <Lbl>TP/SL Grid Search — 3 TP × 5 SL = 15 Combinations</Lbl>
+        <div style={{display:"flex",gap:6}}>
+          <Btn onClick={runSweep} disabled={ip} color="#f97316" style={{padding:"4px 10px",fontSize:11}}>
+            {ip?`Running ${status?.current}/${status?.total}`:done>0&&done<total?`Resume (${done}/${total})`:"Run Sweep"}
+          </Btn>
+          {done>0&&!ip&&<Btn onClick={resetSweep} color="#ef4444" style={{padding:"4px 10px",fontSize:11}}>Reset</Btn>}
+        </div>
+      </div>
+
+      {ip&&(
+        <div style={{marginBottom:12,padding:"8px 12px",borderRadius:4,background:"rgba(249,115,22,0.08)",border:"1px solid rgba(249,115,22,0.2)"}}>
+          <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+            <div style={{flex:1,height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden"}}>
+              <div style={{width:`${(status.current/status.total)*100}%`,height:"100%",background:"#f97316",borderRadius:3,transition:"width 0.5s"}}/>
+            </div>
+            <span style={{fontSize:11,color:"#f97316",fontWeight:600}}>{status.current}/{status.total}</span>
+          </div>
+          <div style={{fontSize:11,color:"#94a3b8"}}>{status.message}</div>
+        </div>
+      )}
+
+      {done===0&&!ip ? (
+        <div style={{fontSize:12,color:"#64748b",padding:"20px 0",textAlign:"center"}}>
+          Grid: TP {grid?.tp.join("%, ")||""}% × SL {grid?.sl.join("%, ")||""}%<br/>
+          Each cell requires a full train cycle. First cell fetches bars (~15 min), subsequent use cache (~2-3 min).<br/>
+          Safe to close browser — runs in background. Results save after each cell.
+        </div>
+      ) : (
+        <>
+          {best && (
+            <div style={{marginBottom:12,padding:"8px 12px",borderRadius:4,background:"rgba(34,197,94,0.06)",border:"1px solid rgba(34,197,94,0.2)"}}>
+              <div style={{fontSize:10,color:"#64748b",textTransform:"uppercase",letterSpacing:0.5,marginBottom:2}}>Best cell so far (by edge vs break-even)</div>
+              <div style={{fontSize:13,color:"#e2e8f0"}}>
+                <span style={{color:"#22c55e",fontWeight:700}}>TP {best.tp_pct}% / SL {best.sl_pct}%</span>
+                <span style={{margin:"0 10px",color:"#475569"}}>|</span>
+                <span>Top-10 WR: <span style={{color:"#e2e8f0",fontWeight:600}}>{best.avg_top10_wr}%</span></span>
+                <span style={{margin:"0 10px",color:"#475569"}}>|</span>
+                <span>Break-even: <span style={{color:"#eab308",fontWeight:600}}>{best.breakeven}%</span></span>
+                <span style={{margin:"0 10px",color:"#475569"}}>|</span>
+                <span>Edge: <span style={{color:best.avg_edge>0?"#22c55e":"#ef4444",fontWeight:700}}>{best.avg_edge>0?"+":""}{best.avg_edge}%</span></span>
+                <span style={{margin:"0 10px",color:"#475569"}}>|</span>
+                <span>Top-10 PnL: <span style={{color:best.avg_top10_pnl>0?"#22c55e":"#ef4444",fontWeight:600}}>{best.avg_top10_pnl>0?"+":""}{best.avg_top10_pnl}%</span></span>
+              </div>
+            </div>
+          )}
+
+          <div style={{marginBottom:8,fontSize:10,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase"}}>
+            Edge = Top-10 Win Rate − Break-even (positive = tradable)
+          </div>
+          <div style={{overflowX:"auto"}}>
+            <table style={{borderCollapse:"collapse",fontSize:11}}>
+              <thead>
+                <tr>
+                  <th style={{padding:"6px 10px",textAlign:"right",color:"#64748b",fontSize:10,fontWeight:500}}>SL ↓ / TP →</th>
+                  {grid?.tp.map(tp => (
+                    <th key={tp} style={{padding:"6px 10px",textAlign:"center",color:"#94a3b8",fontSize:11,fontWeight:700}}>{tp}%</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {grid?.sl.map(sl => (
+                  <tr key={sl}>
+                    <td style={{padding:"6px 10px",textAlign:"right",color:"#94a3b8",fontWeight:700,fontSize:11}}>{sl}%</td>
+                    {grid.tp.map(tp => {
+                      const cell = resultMap[`${tp}_${sl}`];
+                      const running = ip && status?.currentTP===tp && status?.currentSL===sl;
+                      return (
+                        <td key={tp} style={{
+                          padding:"6px",border:"1px solid rgba(255,255,255,0.06)",
+                          background:running?"rgba(249,115,22,0.2)":cell?edgeColor(cell.avg_edge):"rgba(100,116,139,0.05)",
+                          minWidth:110,textAlign:"center"
+                        }}>
+                          {running ? (
+                            <div style={{color:"#f97316",fontSize:10,fontWeight:600}}>Running...</div>
+                          ) : cell ? (
+                            <div>
+                              <div style={{fontSize:14,fontWeight:700,color:cell.avg_edge>0?"#22c55e":cell.avg_edge<-3?"#ef4444":"#eab308",fontVariantNumeric:"tabular-nums"}}>
+                                {cell.avg_edge>0?"+":""}{cell.avg_edge}%
+                              </div>
+                              <div style={{fontSize:9,color:"#94a3b8",marginTop:1}}>
+                                WR {cell.avg_top10_wr}% / BE {cell.breakeven}%
+                              </div>
+                              <div style={{fontSize:9,color:cell.avg_top10_pnl>0?"#22c55e":"#ef4444",marginTop:1,fontVariantNumeric:"tabular-nums"}}>
+                                PnL {cell.avg_top10_pnl>0?"+":""}{cell.avg_top10_pnl}%
+                              </div>
+                            </div>
+                          ) : (
+                            <div style={{color:"#334155",fontSize:10}}>—</div>
+                          )}
+                        </td>);
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div style={{fontSize:10,color:"#475569",marginTop:8,lineHeight:1.5}}>
+            Legend: green cells = model beats break-even. Warning: with 15 tests on the same 53 validation days, some positive results will be due to chance. Look for consistent patterns (e.g., a whole row or column trending positive) rather than single standout cells.
+          </div>
+        </>
+      )}
+    </Box>);
+}
+
 function TrainingTab() {
   const [d,setD]=useState(null);
   const [ld,setLd]=useState(true);
@@ -286,6 +437,7 @@ function TrainingTab() {
             </div>
           ):<div style={{color:"#475569",fontSize:12}}>Select scan hour</div>}
         </Box>)}
+      <SweepSection/>
     </div>);
 }
 

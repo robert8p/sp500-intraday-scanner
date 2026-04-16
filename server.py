@@ -94,8 +94,16 @@ model_meta = {}
 last_scans = {}
 training_in_progress = False
 training_progress = {"phase":"idle","pct":0,"message":""}
+sweep_in_progress = False
+sweep_progress = {"phase":"idle","current":0,"total":0,"message":"","currentTP":None,"currentSL":None}
 
 STATUS_PATH = DATA_DIR / "status.json"
+SWEEP_RESULTS_PATH = DATA_DIR / "sweep_results.json"
+
+def load_sweep_results():
+    try: return json.loads(SWEEP_RESULTS_PATH.read_text())
+    except: return {"grid":[],"startedAt":None,"completedAt":None}
+def save_sweep_results(r): SWEEP_RESULTS_PATH.write_text(json.dumps(r,indent=2))
 def load_status():
     try: return json.loads(STATUS_PATH.read_text())
     except: return {"trained":False,"trainDate":None,"outcomeDays":0,"daysSinceRetrain":0}
@@ -586,6 +594,114 @@ def run_training(tp_pct=None, sl_pct=None):
         training_in_progress = False
 
 # ═══════════════════════════════════════════════════════════════════
+# SWEEP: grid search over TP/SL combinations
+# ═══════════════════════════════════════════════════════════════════
+# Coarse grid: 3 TP × 5 SL = 15 combinations
+SWEEP_TP_VALUES = [0.50, 0.75, 1.00]   # percent
+SWEEP_SL_VALUES = [0.50, 0.75, 1.00, 1.25, 1.50]  # percent
+
+def summarize_models_for_sweep(tp, sl):
+    """After a training completes, extract sweep-relevant summary from model_meta."""
+    summary = {
+        "tp_pct": tp, "sl_pct": sl,
+        "breakeven": round(sl / (sl + tp) * 100, 2),
+        "hours": {},
+        "avg_top10_wr": None, "avg_top10_pnl": None, "avg_auc": None,
+        "avg_base_wr": None, "avg_edge": None,
+        "completedAt": datetime.now(ET).isoformat()
+    }
+    top10_wrs, top10_pnls, aucs, base_wrs = [], [], [], []
+    for h in SCAN_HOURS:
+        m = model_meta.get(h)
+        if not m: continue
+        wr10 = m.get("avg_win_rate_top10", 0) * 100
+        pnl10 = m.get("avg_pnl_top10", 0)
+        auc = m.get("auc", 0)
+        base = m.get("val_win_rate", 0) * 100
+        edge = wr10 - summary["breakeven"]
+        summary["hours"][str(h)] = {
+            "top10_wr": round(wr10, 2),
+            "top10_pnl": round(pnl10, 3),
+            "auc": round(auc, 4),
+            "base_wr": round(base, 2),
+            "edge": round(edge, 2)
+        }
+        top10_wrs.append(wr10); top10_pnls.append(pnl10)
+        aucs.append(auc); base_wrs.append(base)
+
+    if top10_wrs:
+        summary["avg_top10_wr"] = round(float(np.mean(top10_wrs)), 2)
+        summary["avg_top10_pnl"] = round(float(np.mean(top10_pnls)), 3)
+        summary["avg_auc"] = round(float(np.mean(aucs)), 4)
+        summary["avg_base_wr"] = round(float(np.mean(base_wrs)), 2)
+        summary["avg_edge"] = round(summary["avg_top10_wr"] - summary["breakeven"], 2)
+    return summary
+
+def run_sweep(resume=True):
+    """
+    Grid search over TP × SL combinations. Trains a full model suite for each
+    combination, records summary metrics, and saves progress to disk after
+    each cell so it can resume after crashes.
+    """
+    global sweep_in_progress, sweep_progress, training_in_progress
+    if sweep_in_progress: return
+    if training_in_progress: return
+    sweep_in_progress = True
+
+    # Build full grid
+    grid_cells = [(tp, sl) for tp in SWEEP_TP_VALUES for sl in SWEEP_SL_VALUES]
+    total = len(grid_cells)
+
+    # Load existing results for resume
+    existing = load_sweep_results() if resume else {"grid":[],"startedAt":None,"completedAt":None}
+    completed_keys = {f"{r['tp_pct']}_{r['sl_pct']}" for r in existing.get("grid",[])}
+    if not existing.get("startedAt") or not resume:
+        existing = {"grid":[], "startedAt":datetime.now(ET).isoformat(), "completedAt":None,
+                    "gridShape":{"tpValues":SWEEP_TP_VALUES, "slValues":SWEEP_SL_VALUES}}
+        completed_keys = set()
+
+    log.info(f"Sweep: {total} cells, {len(completed_keys)} already complete, {total-len(completed_keys)} to run")
+
+    try:
+        for idx, (tp, sl) in enumerate(grid_cells):
+            key = f"{tp}_{sl}"
+            if key in completed_keys:
+                log.info(f"Sweep cell {idx+1}/{total}: TP {tp}% / SL {sl}% — skipping (cached)")
+                continue
+
+            sweep_progress = {
+                "phase":"running","current":idx+1,"total":total,
+                "currentTP":tp,"currentSL":sl,
+                "message":f"Cell {idx+1}/{total}: TP {tp}% / SL {sl}% (break-even {sl/(sl+tp)*100:.1f}%)"
+            }
+
+            # Call run_training synchronously. It sets training_in_progress=True
+            # during its run, so we wait for it to finish.
+            log.info(f"Sweep cell {idx+1}/{total}: starting TP={tp}% SL={sl}%")
+            run_training(tp_pct=tp/100.0, sl_pct=sl/100.0)
+
+            # After training, extract summary from model_meta
+            cell_summary = summarize_models_for_sweep(tp, sl)
+            existing["grid"].append(cell_summary)
+            save_sweep_results(existing)
+            log.info(f"Sweep cell {idx+1}/{total} done: avg top10 WR {cell_summary['avg_top10_wr']}%, "
+                     f"breakeven {cell_summary['breakeven']}%, edge {cell_summary['avg_edge']}%")
+
+        existing["completedAt"] = datetime.now(ET).isoformat()
+        save_sweep_results(existing)
+        sweep_progress = {"phase":"done","current":total,"total":total,
+            "message":f"Sweep complete. {total} cells evaluated.",
+            "currentTP":None,"currentSL":None}
+        log.info("Sweep complete.")
+
+    except Exception as e:
+        log.error(f"Sweep failed: {e}", exc_info=True)
+        sweep_progress = {"phase":"error","current":0,"total":total,"message":str(e),
+                         "currentTP":None,"currentSL":None}
+    finally:
+        sweep_in_progress = False
+
+# ═══════════════════════════════════════════════════════════════════
 # LIVE SCAN
 # ═══════════════════════════════════════════════════════════════════
 def run_live_scan(scan_hour):
@@ -818,6 +934,31 @@ def cache_status():
 def progress():
     return {"inProgress":training_in_progress,**training_progress,
             "meta":{str(h):model_meta[h] for h in model_meta}}
+
+# ─── SWEEP endpoints ──────────────────────────────────────────────
+@app.post("/api/sweep")
+def trigger_sweep(bg: BackgroundTasks):
+    if sweep_in_progress: return {"status":"already_running"}
+    if training_in_progress: return JSONResponse({"error":"Training in progress; wait for it to finish"},400)
+    bg.add_task(run_sweep, True)  # resume=True
+    total = len(SWEEP_TP_VALUES) * len(SWEEP_SL_VALUES)
+    return {"status":"started","total_cells":total,
+            "grid":{"tp":SWEEP_TP_VALUES,"sl":SWEEP_SL_VALUES}}
+
+@app.post("/api/sweep/reset")
+def reset_sweep():
+    if sweep_in_progress: return JSONResponse({"error":"Cannot reset during sweep"},400)
+    if SWEEP_RESULTS_PATH.exists(): SWEEP_RESULTS_PATH.unlink()
+    return {"status":"ok"}
+
+@app.get("/api/sweep/status")
+def sweep_status():
+    return {"inProgress":sweep_in_progress, **sweep_progress,
+            "grid":{"tp":SWEEP_TP_VALUES,"sl":SWEEP_SL_VALUES}}
+
+@app.get("/api/sweep/results")
+def sweep_results():
+    return load_sweep_results()
 
 @app.get("/api/outcomes/summary")
 def outcome_summary():
