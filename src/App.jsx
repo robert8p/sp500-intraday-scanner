@@ -21,7 +21,7 @@ function SourceBadge({source,trained}) {
 
 function WinBar({winProb,ev}) {
   const pct=(winProb*100).toFixed(1);
-  const c=winProb>0.58?"#22c55e":winProb>0.52?"#a3e635":winProb>0.50?"#eab308":"#6b7280";
+  const c=winProb>0.70?"#22c55e":winProb>0.65?"#a3e635":winProb>0.61?"#eab308":winProb>0.55?"#f97316":"#6b7280";
   const evColor = ev>0?"#22c55e":ev<0?"#ef4444":"#64748b";
   return (
     <div style={{display:"flex",alignItems:"center",gap:6,minWidth:180}}>
@@ -45,7 +45,7 @@ function Fc({value,label}) {
 
 // ─── SCANNER ─────────────────────────────────────────────────────
 function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10}) {
-  const [mode,setMode]=useState("all50"); // all50 = all above 50%, top10, top20
+  const [mode,setMode]=useState("posEV");
 
   if(source==="offline"||!data||data.length===0) return (
     <Box style={{padding:40,textAlign:"center"}}>
@@ -53,8 +53,9 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10})
       <div style={{fontSize:12,color:"#475569"}}>{message||"Train model, then scan during market hours."}</div>
     </Box>);
 
-  const filtered = mode==="all50" ? data.filter(s=>s.winProb>=0.50)
-    : mode==="all55" ? data.filter(s=>s.winProb>=0.55)
+  const filtered = mode==="be" ? data.filter(s=>s.winProb>=0.612)
+    : mode==="be5" ? data.filter(s=>s.winProb>=0.662)
+    : mode==="posEV" ? data.filter(s=>s.ev>0)
     : data.slice(0, mode==="top10"?10:20);
   const posEV = data.filter(s=>s.ev>0);
   const avgEV = posEV.length>0 ? posEV.reduce((s,r)=>s+r.ev,0)/posEV.length : 0;
@@ -64,7 +65,7 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10})
       <div style={{display:"flex",gap:12,alignItems:"center",marginBottom:16,flexWrap:"wrap"}}>
         <div style={{display:"flex",alignItems:"center",gap:6}}>
           <span style={{fontSize:10,color:"#475569",textTransform:"uppercase",letterSpacing:0.5}}>Show</span>
-          {[["all50","Win>50%"],["all55","Win>55%"],["top10","Top 10"],["top20","Top 20"]].map(([m,l])=>
+          {[["posEV","+EV"],["be","Win>61%"],["be5","Win>66%"],["top10","Top 10"],["top20","Top 20"]].map(([m,l])=>
             <Btn key={m} active={mode===m} onClick={()=>setMode(m)}>{l}</Btn>)}
         </div>
         <span style={{fontSize:11,color:"#334155"}}>
@@ -83,7 +84,7 @@ function ScannerTab({data,scanHour,source,elapsed,message,modelWR10,modelPnL10})
         <Box style={{padding:12}}>
           <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
             <span style={{fontSize:11,color:"#64748b",letterSpacing:0.5,textTransform:"uppercase"}}>
-              {filtered.length} stocks — TP +0.95% / SL -0.95% / Close 15:55
+              {filtered.length} stocks — TP +0.95% / SL -1.50% / Close 15:55 (break-even: 61.2% win rate)
             </span>
             {posEV.length>0&&<span style={{fontSize:11,color:"#22c55e"}}>Avg EV (positive): +{avgEV.toFixed(3)}%</span>}
           </div>
@@ -137,7 +138,7 @@ function TrainingTab() {
   return (
     <div style={{display:"flex",flexDirection:"column",gap:12}}>
       <Box>
-        <Lbl>Model Training — First-Passage (+0.95% TP / -0.95% SL)</Lbl>
+        <Lbl>Model Training — First-Passage (+0.95% TP / -1.50% SL, break-even 61.2%)</Lbl>
         <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
           <div style={{fontSize:12,lineHeight:2,color:"#94a3b8"}}>
             {[
@@ -190,12 +191,15 @@ function TrainingTab() {
                     <span style={{color:"#475569",fontSize:11,marginLeft:8}}>vs base {(sm.val_win_rate*100).toFixed(1)}%</span></div>
                   <div><span style={{color:"#64748b",display:"inline-block",minWidth:160}}>Top-10 Avg P&L:</span>
                     <span style={{color:sm.avg_pnl_top10>0?"#22c55e":"#ef4444",fontWeight:700,fontSize:14}}>{sm.avg_pnl_top10>0?"+":""}{sm.avg_pnl_top10}%</span></div>
-                  <div><span style={{color:"#64748b",display:"inline-block",minWidth:160}}>EV (Win&gt;50% stocks):</span>
+                  <div><span style={{color:"#64748b",display:"inline-block",minWidth:160}}>EV (Win&gt;61% stocks):</span>
+                    <span style={{color:sm.ev_above_breakeven>0?"#22c55e":"#ef4444",fontWeight:700,fontSize:14}}>{sm.ev_above_breakeven>0?"+":""}{sm.ev_above_breakeven}%</span>
+                    <span style={{color:"#475569",fontSize:11,marginLeft:8}}>({sm.n_above_breakeven} stocks)</span></div>
+                  <div><span style={{color:"#64748b",display:"inline-block",minWidth:160}}>EV (Win&gt;66% stocks):</span>
+                    <span style={{color:sm.ev_above_breakeven_plus5>0?"#22c55e":"#ef4444",fontWeight:700,fontSize:14}}>{sm.ev_above_breakeven_plus5>0?"+":""}{sm.ev_above_breakeven_plus5}%</span>
+                    <span style={{color:"#475569",fontSize:11,marginLeft:8}}>({sm.n_above_breakeven_plus5} stocks)</span></div>
+                  <div><span style={{color:"#64748b",display:"inline-block",minWidth:160}}>EV (Top-10 default):</span>
                     <span style={{color:sm.ev_above_50pct>0?"#22c55e":"#ef4444",fontWeight:700,fontSize:14}}>{sm.ev_above_50pct>0?"+":""}{sm.ev_above_50pct}%</span>
-                    <span style={{color:"#475569",fontSize:11,marginLeft:8}}>({sm.n_above_50pct} stocks)</span></div>
-                  <div><span style={{color:"#64748b",display:"inline-block",minWidth:160}}>EV (Win&gt;55% stocks):</span>
-                    <span style={{color:sm.ev_above_55pct>0?"#22c55e":"#ef4444",fontWeight:700,fontSize:14}}>{sm.ev_above_55pct>0?"+":""}{sm.ev_above_55pct}%</span>
-                    <span style={{color:"#475569",fontSize:11,marginLeft:8}}>({sm.n_above_55pct} stocks)</span></div>
+                    <span style={{color:"#475569",fontSize:11,marginLeft:8}}>({sm.n_above_50pct} samples @ &gt;50%)</span></div>
                   <div><span style={{color:"#64748b",display:"inline-block",minWidth:160}}>Exit reasons (val):</span>
                     <span style={{fontSize:11}}>{sm.val_exit_reasons?Object.entries(sm.val_exit_reasons).map(([r,n])=>`${r}: ${n}`).join(", "):""}</span></div>
                 </div>
@@ -334,7 +338,7 @@ export default function SP500Scanner() {
           <SourceBadge source={loading?"loading":source} trained={health?.trained}/>
         </div>
         <div style={{display:"flex",gap:4,fontSize:11,flexWrap:"wrap",alignItems:"center"}}>
-          <span style={{color:"#eab308",fontWeight:600}}>TP +0.95% / SL -0.95% / Close 15:55</span>
+          <span style={{color:"#eab308",fontWeight:600}}>TP +0.95% / SL -1.50% / Close 15:55</span>
           {lastUpdate&&<><span style={{color:"#334155",margin:"0 4px"}}>|</span><span style={{color:"#94a3b8"}}>{new Date(lastUpdate).toLocaleString()}</span></>}
         </div>
       </div>

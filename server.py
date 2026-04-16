@@ -34,7 +34,7 @@ PORT          = int(os.environ.get("PORT", 10000))
 ET = ZoneInfo("America/New_York")
 SCAN_HOURS = [10, 11, 12, 13, 14, 15]
 TP_PCT = 0.0095   # +0.95% take profit
-SL_PCT = 0.0095   # -0.95% stop loss
+SL_PCT = 0.0150   # -1.50% stop loss (asymmetric)
 FORCED_CLOSE_MIN = 15*60+55  # 15:55 ET in minutes
 
 TICKERS = [
@@ -470,6 +470,16 @@ def run_training():
             avg_pnl10 = np.mean(pnl10_list) if pnl10_list else 0
 
             # EV at various thresholds
+            # Break-even threshold for asymmetric barriers: TP*P = SL*(1-P) → P = SL/(SL+TP)
+            breakeven_p = SL_PCT / (SL_PCT + TP_PCT)
+
+            # EV at various probability thresholds
+            def ev_at(thresh):
+                subset = val_df[val_df["prob"] >= thresh]
+                if len(subset) == 0: return 0, 0
+                return subset["pnl"].mean(), len(subset)
+            ev_at_be, n_at_be = ev_at(breakeven_p)
+            ev_at_be5, n_at_be5 = ev_at(breakeven_p + 0.05)
             ev_at_50 = val_df[val_df["prob"]>=0.5]["pnl"].mean() if len(val_df[val_df["prob"]>=0.5])>0 else 0
             n_above_50 = len(val_df[val_df["prob"]>=0.5])
             ev_at_55 = val_df[val_df["prob"]>=0.55]["pnl"].mean() if len(val_df[val_df["prob"]>=0.55])>0 else 0
@@ -503,6 +513,11 @@ def run_training():
                 "n_above_50pct":int(n_above_50),
                 "ev_above_55pct":round(float(ev_at_55),3),
                 "n_above_55pct":int(n_above_55),
+                "breakeven_threshold":round(breakeven_p,3),
+                "ev_above_breakeven":round(float(ev_at_be),3),
+                "n_above_breakeven":int(n_at_be),
+                "ev_above_breakeven_plus5":round(float(ev_at_be5),3),
+                "n_above_breakeven_plus5":int(n_at_be5),
                 "val_exit_reasons":val_reasons,
                 "importance":imp,
                 "trained_at":datetime.now(ET).isoformat(),
@@ -571,7 +586,7 @@ def run_live_scan(scan_hour):
     for i in range(len(raw_feats)):
         si, rf = stock_info[i], raw_feats[i]
         wp = float(cal_probs[i])
-        ev = (2*wp - 1) * TP_PCT * 100  # EV per trade in %
+        ev = (wp * TP_PCT - (1 - wp) * SL_PCT) * 100  # EV per trade in % (asymmetric)
         results.append({
             "rank":0,"ticker":si["ticker"],"sector":si["sector"],
             "price":f"{si['price']:.2f}",
